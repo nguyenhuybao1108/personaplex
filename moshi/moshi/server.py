@@ -86,6 +86,12 @@ def wrap_with_system_tags(text: str) -> str:
     return f"<system> {cleaned} <system>"
 
 
+async def handle_topics(request):
+    """Return list of available conversation topics."""
+    from .topics import get_topics_list
+    return web.json_response(get_topics_list())
+
+
 @dataclass
 class ServerState:
     mimi: MimiModel
@@ -149,25 +155,36 @@ class ServerState:
         requested_voice_prompt_path = None
         voice_prompt_path = None
         if self.voice_prompt_dir is not None:
-            voice_prompt_filename = request.query["voice_prompt"]
+            voice_prompt_filename = request.query.get("voice_prompt", "")
             requested_voice_prompt_path = None
-            if voice_prompt_filename is not None:
+            if voice_prompt_filename is not None and voice_prompt_filename != "":
                 requested_voice_prompt_path = os.path.join(self.voice_prompt_dir, voice_prompt_filename)
             # If the voice prompt file does not exist, find a valid (s0) voiceprompt file in the directory
-            if requested_voice_prompt_path is None or not os.path.exists(requested_voice_prompt_path):
-                raise FileNotFoundError(
-                    f"Requested voice prompt '{voice_prompt_filename}' not found in '{self.voice_prompt_dir}'"
+            if requested_voice_prompt_path is not None and not os.path.exists(requested_voice_prompt_path):
+                logger.warning(
+                    f"Requested voice prompt '{voice_prompt_filename}' not found in '{self.voice_prompt_dir}', using default voice"
                 )
             else:
                 voice_prompt_path = requested_voice_prompt_path
-                
-        if self.lm_gen.voice_prompt != voice_prompt_path:
+        else:
+            logger.info("Voice prompts disabled (voice_prompt_dir not set)")
+
+        if voice_prompt_path is not None and self.lm_gen.voice_prompt != voice_prompt_path:
             if voice_prompt_path.endswith('.pt'):
                 # Load pre-saved voice prompt embeddings
                 self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
             else:
                 self.lm_gen.load_voice_prompt(voice_prompt_path)
-        self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
+
+        # Resolve text_prompt: use topic_id if provided, else use text_prompt directly
+        topic_id = request.query.get("topic_id", "")
+        if topic_id:
+            from .topics import get_topic_prompt
+            text_prompt = get_topic_prompt(topic_id)
+        else:
+            text_prompt = request.query.get("text_prompt", "")
+
+        self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(text_prompt)) if len(text_prompt) > 0 else None
         seed = int(request["seed"]) if "seed" in request.query else None
 
         async def recv_loop():
@@ -323,31 +340,41 @@ def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Opti
 
     logger.info("retrieving voice prompts")
 
-    voices_tgz = hf_hub_download(hf_repo, "voices.tgz")
-    voices_tgz = Path(voices_tgz)
-    voices_dir = voices_tgz.parent / "voices"
+    try:
+        voices_tgz = hf_hub_download(hf_repo, "voices.tgz")
+        voices_tgz = Path(voices_tgz)
+        voices_dir = voices_tgz.parent / "voices"
 
-    if not voices_dir.exists():
-        logger.info(f"extracting {voices_tgz} to {voices_dir}")
-        with tarfile.open(voices_tgz, "r:gz") as tar:
-            tar.extractall(path=voices_tgz.parent)
+        if not voices_dir.exists():
+            logger.info(f"extracting {voices_tgz} to {voices_dir}")
+            with tarfile.open(voices_tgz, "r:gz") as tar:
+                tar.extractall(path=voices_tgz.parent)
 
-    if not voices_dir.exists():
-        raise RuntimeError("voices.tgz did not contain a 'voices/' directory")
+        if not voices_dir.exists():
+            raise RuntimeError("voices.tgz did not contain a 'voices/' directory")
 
-    return str(voices_dir)
+        return str(voices_dir)
+    except Exception as e:
+        logger.warning(f"Could not download voices.tgz from {hf_repo}: {e}")
+        logger.info("Running without voice prompts. Use --voice-prompt-dir to provide voice files.")
+        return None
 
 
 def _get_static_path(static: Optional[str]) -> Optional[str]:
     if static is None:
         logger.info("retrieving the static content")
-        dist_tgz = hf_hub_download("nvidia/personaplex-7b-v1", "dist.tgz")
-        dist_tgz = Path(dist_tgz)
-        dist = dist_tgz.parent / "dist"
-        if not dist.exists():
-            with tarfile.open(dist_tgz, "r:gz") as tar:
-                tar.extractall(path=dist_tgz.parent)
-        return str(dist)
+        try:
+            dist_tgz = hf_hub_download("nvidia/personaplex-7b-v1", "dist.tgz")
+            dist_tgz = Path(dist_tgz)
+            dist = dist_tgz.parent / "dist"
+            if not dist.exists():
+                with tarfile.open(dist_tgz, "r:gz") as tar:
+                    tar.extractall(path=dist_tgz.parent)
+            return str(dist)
+        except Exception as e:
+            logger.warning(f"Could not download static content: {e}")
+            logger.info("Running without static UI. Use --static to provide static files path.")
+            return None
     elif static != "none":
         # When set to the "none" string, we don't serve any static content.
         return static
@@ -458,6 +485,7 @@ def main():
     state.warmup()
     app = web.Application()
     app.router.add_get("/api/chat", state.handle_chat)
+    app.router.add_get("/api/topics", handle_topics)
     if static_path is not None:
         async def handle_root(_):
             return web.FileResponse(os.path.join(static_path, "index.html"))
